@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+</head>
+<style>
+    #app {
+        border: solid 2px black;
+        background-color: red;
+        width: 100px;
+        height: 100px;
+    }
+</style>
+<body>
+    <div id="app"></div>
+</body>
+<script>
+    let i = 0
+    const app = document.getElementById("app")
+    const sum = () => { 
+        const start = performance.now()
+        i = i + 20
+        app.style.marginTop = i + "px"
+        app.innerHTML = i
+        console.log(i)
+        const time = performance.now() - start
+        console.log(time)
+        // setTimeout(sum,1000)
+    }
+
+    setInterval(sum,1000)
+</script>
+</html>
