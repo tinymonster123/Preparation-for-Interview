@@ -1,0 +1,25 @@
+{
+  "name": "memory-leak-lab",
+  "version": "1.0.0",
+  "description": "Node.js 内存泄漏排查实战",
+  "scripts": {
+    "leak1": "node --expose-gc 01-global-variable.js",
+    "leak2": "node --expose-gc 02-closure.js",
+    "leak3": "node --expose-gc 03-event-listener.js",
+    "leak4": "node --expose-gc 04-timer.js",
+    "leak5": "node --expose-gc 05-cache-no-limit.js",
+    "server-leak": "node --expose-gc 06-server-leak.js",
+    "server-fixed": "node --expose-gc 06-server-fixed.js",
+    "inspect-leak": "node --inspect --expose-gc 06-server-leak.js",
+    "heapdump": "node --expose-gc 07-heapdump-demo.js"
+  },
+  "main": "01-global-variable.js",
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "blessed": "^0.1.81",
+    "blessed-contrib": "^4.11.0"
+  }
+}
