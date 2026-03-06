@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>阶段4：对象池 + 背压控制 + 主动释放</title>
+  <style>
+    * { margin: 0; padding: 0; }
+    body { background: #1a1a2e; color: #eee; font-family: monospace; overflow: hidden; }
+    #info {
+      position: fixed; top: 10px; left: 10px; z-index: 999;
+      background: rgba(0,0,0,0.8); padding: 12px 16px; border-radius: 8px;
+      font-size: 14px; line-height: 1.8;
+    }
+    #info .bad { color: #ff4444; font-weight: bold; }
+    #info .good { color: #44ff44; font-weight: bold; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="info">
+    <div>状态: <span id="status" class="good">阶段4 - 对象池 + 背压控制 + 主动释放</span></div>
+    <div>当前节点数: <span id="count">0</span></div>
+    <div>轮次: <span id="round">0</span></div>
+    <div>FPS: <span id="fps" class="bad">--</span></div>
+    <hr style="border-color:#444; margin:6px 0">
+    <div style="color:#44ff44; font-weight:bold">-- Performance API 实时监控 --</div>
+    <div>Long Task 次数: <span id="longTaskCount" class="bad">0</span></div>
+    <div>最长 Long Task: <span id="longTaskMax" class="bad">0</span> ms</div>
+    <div>JS Heap: <span id="heapUsed" class="bad">--</span> / <span id="heapTotal">--</span> MB</div>
+    <div>Heap 峰值: <span id="heapPeak" class="bad">--</span> MB</div>
+    <div>每帧耗时: <span id="frameDuration" class="bad">--</span> ms</div>
+    <div>上传队列: <span id="queueSize" class="good">0</span> | 生产中: <span id="inflight" class="good">0</span></div>
+    <hr style="border-color:#444; margin:6px 0">
+    <div style="color:#ff9900; font-weight:bold">-- 对象池状态 --</div>
+    <div>池大小: <span id="poolSize" class="good">0</span> / <span id="poolCapacity">500</span></div>
+    <div>池命中: <span id="poolHit" class="good">0</span> 次</div>
+    <div>池未命中: <span id="poolMiss">0</span> 次</div>
+    <hr style="border-color:#444; margin:6px 0">
+    <div style="color:#44ff44; font-weight:bold">-- 10秒采样报告 --</div>
+    <pre id="report" style="font-size:12px; color:#ccc; white-space:pre-wrap;">等待采样中...</pre>
+  </div>
+  <canvas id="glCanvas"></canvas>
+
+  <script>
+    // ============================================================
+    // 【阶段 4】v3：对象池 + 背压控制 + 主动内存释放
+    //
+    // v1 的问题：createImageBitmap 异步解码，但 500 个 bitmap 同时存活
+    //   → 峰值内存 414MB，GC 频繁
+    //
+    // v2 的错误尝试：干掉 createImageBitmap，直接 canvas → texSubImage2D
+    //   → 主线程同步读像素反而更慢
+    //
+    // v3 的正确解法：保留 createImageBitmap 异步解码，但加背压控制
+    //   🔵 MAX_INFLIGHT = 10：同时最多只有 10 个 ImageBitmap 存在
+    //   🔵 创建速率 = 消费速率：upload 消费一个，才允许创建一个
+    //   🔵 峰值内存从 500×256KB = 128MB → 10×256KB = 2.5MB
+    // ============================================================
+
+    const canvas = document.getElementById('glCanvas');
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    const gl = canvas.getContext('webgl', { antialias: false });
+    if (!gl) { alert('WebGL 不可用'); }
+
+    const vsSource = `
+      attribute vec2 a_position;
+      attribute vec2 a_texCoord;
+      varying vec2 v_texCoord;
+      void main() {
+        vec2 clipSpace = (a_position / vec2(${canvas.width}.0, ${canvas.height}.0)) * 2.0 - 1.0;
+        gl_Position = vec4(clipSpace * vec2(1, -1), 0, 1);
+        v_texCoord = a_texCoord;
+      }
+    `;
+    const fsSource = `
+      precision mediump float;
+      varying vec2 v_texCoord;
+      uniform sampler2D u_image;
+      void main() {
+        gl_FragColor = texture2D(u_image, v_texCoord);
+      }
+    `;
+
+    function createShader(gl, type, source) {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, source);
+      gl.compileShader(s);
+      return s;
+    }
+
+    const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
+    const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+    const program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+    gl.useProgram(program);
+
+    const posLoc = gl.getAttribLocation(program, 'a_position');
+    const texLoc = gl.getAttribLocation(program, 'a_texCoord');
+
+    const texCoordBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      0, 0, 1, 0, 0, 1,
+      0, 1, 1, 0, 1, 1,
+    ]), gl.STATIC_DRAW);
+
+    const posBuffer = gl.createBuffer();
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    // ---------- 配置 ----------
+    const IMG_COUNT = 500;
+    const IMG_SIZE = 256;
+    const DESTROY_INTERVAL = 800;
+    const UPLOAD_BUDGET = 12;    // 每帧纹理上传预算 (ms)
+    const MAX_INFLIGHT = 10;     // 🔵 背压：同时存活的 ImageBitmap 上限
+
+    let activeSprites = [];
+    let round = 0;
+    let currentRound = 0;
+
+    // ==========================================================
+    // 🔵 Sprite 对象池（同 v1）
+    // ==========================================================
+
+    const spritePool = [];
+    const POOL_CAPACITY = 500;
+    let poolHitCount = 0;
+    let poolMissCount = 0;
+
+    function acquireSprite() {
+      if (spritePool.length > 0) {
+        poolHitCount++;
+        return spritePool.pop();
+      }
+      poolMissCount++;
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, IMG_SIZE, IMG_SIZE, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      return { texture: tex, x: 0, y: 0, size: 0 };
+    }
+
+    function releaseSprite(sprite) {
+      if (spritePool.length < POOL_CAPACITY) {
+        spritePool.push(sprite);
+      } else {
+        gl.deleteTexture(sprite.texture);
+      }
+    }
+
+    // ==========================================================
+    // 🔵 复用 Canvas（同 v1）
+    // ==========================================================
+
+    const reusableCanvas = document.createElement('canvas');
+    reusableCanvas.width = IMG_SIZE;
+    reusableCanvas.height = IMG_SIZE;
+    const reusableCtx = reusableCanvas.getContext('2d');
+
+    function drawRandomImage() {
+      const ctx = reusableCtx;
+      const r = Math.random() * 255 | 0;
+      const g = Math.random() * 255 | 0;
+      const b = Math.random() * 255 | 0;
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fillRect(0, 0, IMG_SIZE, IMG_SIZE);
+      for (let j = 0; j < 5; j++) {
+        ctx.strokeStyle = `rgba(${Math.random()*255|0},${Math.random()*255|0},${Math.random()*255|0},0.8)`;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(Math.random() * IMG_SIZE, Math.random() * IMG_SIZE);
+        ctx.lineTo(Math.random() * IMG_SIZE, Math.random() * IMG_SIZE);
+        ctx.stroke();
+      }
+    }
+
+    // ==========================================================
+    // 🔵 核心：背压控制的生产-消费管线
+    //
+    // 生产端（Canvas绘制 + createImageBitmap）和消费端（texSubImage2D）
+    // 通过 inflight 计数器联动：
+    //   - 消费端每 upload 一张 → inflight--
+    //   - 生产端检查 inflight < MAX_INFLIGHT 才允许创建
+    //   - 这样最多只有 MAX_INFLIGHT 个 ImageBitmap 同时存活
+    // ==========================================================
+
+    const uploadQueue = [];   // 已解码待上传的 { bitmap, sprite, round }
+    let remaining = 0;        // 本轮还有多少张图没开始生产
+    let inflight = 0;         // 当前正在异步解码中的 ImageBitmap 数量
+
+    // 🔵 消费端：时间切片上传
+    function processUploadQueue(frameStart) {
+      while (uploadQueue.length > 0) {
+        if (performance.now() - frameStart >= UPLOAD_BUDGET) break;
+
+        const task = uploadQueue.shift();
+
+        if (task.round !== currentRound) {
+          task.bitmap.close();
+          releaseSprite(task.sprite);
+          continue;
+        }
+
+        gl.bindTexture(gl.TEXTURE_2D, task.sprite.texture);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, task.bitmap);
+
+        // 🔵 立刻 close —— 绕过 GC，释放底层 C++ 内存
+        task.bitmap.close();
+
+        task.sprite.x = Math.random() * canvas.width;
+        task.sprite.y = Math.random() * canvas.height;
+        task.sprite.size = 30 + Math.random() * 60;
+        activeSprites.push(task.sprite);
+      }
+
+      document.getElementById('count').textContent = activeSprites.length;
+      document.getElementById('queueSize').textContent = uploadQueue.length;
+      document.getElementById('inflight').textContent = inflight;
+      document.getElementById('poolSize').textContent = spritePool.length;
+      document.getElementById('poolHit').textContent = poolHitCount;
+      document.getElementById('poolMiss').textContent = poolMissCount;
+    }
+
+    // 🔵 生产端：受背压控制，每帧只允许生产 MAX_INFLIGHT 个
+    function produceImages() {
+      while (remaining > 0 && inflight < MAX_INFLIGHT) {
+        remaining--;
+        inflight++;
+
+        const thisRound = currentRound;
+
+        drawRandomImage();
+        const sprite = acquireSprite();
+
+        createImageBitmap(reusableCanvas).then((bitmap) => {
+          inflight--;
+
+          if (thisRound !== currentRound) {
+            bitmap.close();
+            releaseSprite(sprite);
+            return;
+          }
+
+          uploadQueue.push({ bitmap, sprite, round: thisRound });
+        });
+      }
+    }
+
+    function startNewRound() {
+      round++;
+      currentRound = round;
+      remaining = IMG_COUNT;
+      document.getElementById('round').textContent = round;
+    }
+
+    function recycleAllSprites() {
+      for (const sprite of activeSprites) {
+        releaseSprite(sprite);
+      }
+      activeSprites = [];
+
+      while (uploadQueue.length > 0) {
+        const task = uploadQueue.pop();
+        task.bitmap.close();
+        releaseSprite(task.sprite);
+      }
+
+      remaining = 0;
+      // inflight 的 bitmap 会在 Promise resolve 时通过轮次校验被 close
+
+      document.getElementById('count').textContent = 0;
+      document.getElementById('queueSize').textContent = 0;
+      document.getElementById('poolSize').textContent = spritePool.length;
+    }
+
+    // ---------- 渲染循环 ----------
+
+    function drawQuad(item) {
+      const { x, y, size, texture } = item;
+      const x1 = x, x2 = x + size, y1 = y, y2 = y + size;
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        x1, y1, x2, y1, x1, y2,
+        x1, y2, x2, y1, x2, y2,
+      ]), gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(posLoc);
+      gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+      gl.enableVertexAttribArray(texLoc);
+      gl.vertexAttribPointer(texLoc, 2, gl.FLOAT, false, 0, 0);
+
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+
+    let frameCount = 0;
+    let lastFpsTime = performance.now();
+
+    function render() {
+      const frameStart = performance.now();
+
+      // 🔵 每帧：先消费（上传），再生产（填充管线）
+      processUploadQueue(frameStart);
+      produceImages();
+
+      frameCount++;
+      const now = performance.now();
+      if (now - lastFpsTime >= 1000) {
+        const fps = frameCount;
+        document.getElementById('fps').textContent = fps;
+        document.getElementById('fps').style.color = fps < 50 ? '#ff4444' : '#44ff44';
+        frameCount = 0;
+        lastFpsTime = now;
+      }
+
+      gl.clearColor(0.1, 0.1, 0.18, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      for (const item of activeSprites) {
+        drawQuad(item);
+      }
+
+      requestAnimationFrame(render);
+    }
+
+    // ---------- 启动 ----------
+    setInterval(() => {
+      recycleAllSprites();
+      startNewRound();
+    }, DESTROY_INTERVAL);
+
+    startNewRound();
+    render();
+
+    console.log('🔵 阶段4 v3: 对象池 + 背压控制 + 主动释放模式已启动');
+
+    // ============================================================
+    // Performance API 监控
+    // ============================================================
+
+    let longTaskCount = 0;
+    let longTaskMax = 0;
+    const longTaskDurations = [];
+
+    if ('PerformanceObserver' in window) {
+      const longTaskObserver = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          longTaskCount++;
+          longTaskMax = Math.max(longTaskMax, entry.duration);
+          longTaskDurations.push(entry.duration);
+          document.getElementById('longTaskCount').textContent = longTaskCount;
+          document.getElementById('longTaskMax').textContent = longTaskMax.toFixed(1);
+        }
+      });
+      try {
+        longTaskObserver.observe({ type: 'longtask', buffered: true });
+      } catch (e) {
+        console.warn('Long Task Observer 不可用:', e.message);
+      }
+    }
+
+    let heapPeak = 0;
+    const heapSamples = [];
+
+    function sampleMemory() {
+      if (performance.memory) {
+        const used = performance.memory.usedJSHeapSize;
+        const total = performance.memory.totalJSHeapSize;
+        const usedMB = (used / 1048576).toFixed(1);
+        const totalMB = (total / 1048576).toFixed(1);
+        heapPeak = Math.max(heapPeak, used);
+        heapSamples.push({ t: performance.now(), used, total });
+        document.getElementById('heapUsed').textContent = usedMB;
+        document.getElementById('heapTotal').textContent = totalMB;
+        document.getElementById('heapPeak').textContent = (heapPeak / 1048576).toFixed(1);
+      }
+    }
+    setInterval(sampleMemory, 200);
+
+    let lastFrameTime = performance.now();
+    const frameDurations = [];
+
+    function measureFrame() {
+      const now = performance.now();
+      const dt = now - lastFrameTime;
+      lastFrameTime = now;
+      frameDurations.push(dt);
+      document.getElementById('frameDuration').textContent = dt.toFixed(1);
+      document.getElementById('frameDuration').style.color = dt > 16.6 ? '#ff4444' : '#44ff44';
+      requestAnimationFrame(measureFrame);
+    }
+    requestAnimationFrame(measureFrame);
+
+    setTimeout(() => {
+      let gcCount = 0;
+      for (let i = 1; i < heapSamples.length; i++) {
+        const drop = heapSamples[i - 1].used - heapSamples[i].used;
+        if (drop > 500000) gcCount++;
+      }
+
+      const droppedFrames = frameDurations.filter(d => d > 20).length;
+      const totalFrames = frameDurations.length;
+      const avgFrameTime = frameDurations.reduce((a, b) => a + b, 0) / totalFrames;
+      const maxFrameTime = Math.max(...frameDurations);
+
+      const avgLongTask = longTaskDurations.length
+        ? (longTaskDurations.reduce((a, b) => a + b, 0) / longTaskDurations.length).toFixed(1)
+        : 'N/A';
+
+      const report = [
+        `====== 阶段4 性能报告 (10s 采样) ======`,
+        ``,
+        `【Long Task】`,
+        `  总次数: ${longTaskCount}`,
+        `  最长: ${longTaskMax.toFixed(1)} ms`,
+        `  平均: ${avgLongTask} ms`,
+        ``,
+        `【帧率】`,
+        `  总帧数: ${totalFrames}`,
+        `  平均帧耗时: ${avgFrameTime.toFixed(1)} ms (${(1000/avgFrameTime).toFixed(0)} FPS)`,
+        `  最长帧: ${maxFrameTime.toFixed(1)} ms`,
+        `  掉帧次数 (>20ms): ${droppedFrames} / ${totalFrames} (${(droppedFrames/totalFrames*100).toFixed(1)}%)`,
+        ``,
+        `【内存 (JS Heap)】`,
+        `  峰值: ${(heapPeak / 1048576).toFixed(1)} MB`,
+        `  GC 触发次数: ~${gcCount}`,
+        `  采样点数: ${heapSamples.length}`,
+        heapSamples.length >= 2
+          ? `  最低: ${(Math.min(...heapSamples.map(s=>s.used)) / 1048576).toFixed(1)} MB`
+          + `\n  最高: ${(Math.max(...heapSamples.map(s=>s.used)) / 1048576).toFixed(1)} MB`
+          + `\n  波动幅度: ${((Math.max(...heapSamples.map(s=>s.used)) - Math.min(...heapSamples.map(s=>s.used))) / 1048576).toFixed(1)} MB`
+          : '',
+        ``,
+        `【对象池】`,
+        `  池命中: ${poolHitCount}`,
+        `  池未命中: ${poolMissCount}`,
+        `  命中率: ${poolHitCount + poolMissCount > 0 ? ((poolHitCount / (poolHitCount + poolMissCount)) * 100).toFixed(1) : 0}%`,
+        ``,
+        `========================================`,
+      ].join('\n');
+
+      document.getElementById('report').textContent = report;
+      console.log(report);
+      window.__perfData = { longTaskDurations, frameDurations, heapSamples, gcCount, poolHitCount, poolMissCount };
+    }, 10000);
+  </script>
+</body>
+</html>

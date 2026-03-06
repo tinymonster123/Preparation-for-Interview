@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>阶段1：制造灾难 - GC 抖动基线</title>
+  <style>
+    * { margin: 0; padding: 0; }
+    body { background: #1a1a2e; color: #eee; font-family: monospace; overflow: hidden; }
+    #info {
+      position: fixed; top: 10px; left: 10px; z-index: 999;
+      background: rgba(0,0,0,0.8); padding: 12px 16px; border-radius: 8px;
+      font-size: 14px; line-height: 1.8;
+    }
+    #info .bad { color: #ff4444; font-weight: bold; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="info">
+    <div>状态: <span id="status" class="bad">运行中 - 疯狂创建/销毁节点</span></div>
+    <div>当前节点数: <span id="count">0</span></div>
+    <div>轮次: <span id="round">0</span></div>
+    <div>FPS: <span id="fps" class="bad">--</span></div>
+    <hr style="border-color:#444; margin:6px 0">
+    <div style="color:#ff9900; font-weight:bold">-- Performance API 实时监控 --</div>
+    <div>Long Task 次数: <span id="longTaskCount" class="bad">0</span></div>
+    <div>最长 Long Task: <span id="longTaskMax" class="bad">0</span> ms</div>
+    <div>JS Heap: <span id="heapUsed" class="bad">--</span> / <span id="heapTotal">--</span> MB</div>
+    <div>Heap 峰值: <span id="heapPeak" class="bad">--</span> MB</div>
+    <div>每帧耗时: <span id="frameDuration" class="bad">--</span> ms</div>
+    <hr style="border-color:#444; margin:6px 0">
+    <div style="color:#ff9900; font-weight:bold">-- 10秒采样报告 --</div>
+    <pre id="report" style="font-size:12px; color:#ccc; white-space:pre-wrap;">等待采样中...</pre>
+  </div>
+  <canvas id="glCanvas"></canvas>
+
+  <script>
+    // ============================================================
+    // 【阶段 1】故意写出最烂的代码 —— 制造 GC 抖动 + Long Task
+    // ============================================================
+
+    const canvas = document.getElementById('glCanvas');
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    // 获取 WebGL 上下文
+    const gl = canvas.getContext('webgl', { antialias: false });
+    if (!gl) { alert('WebGL 不可用'); }
+
+    // ---------- 极简 WebGL 着色器 ----------
+    const vsSource = `
+      attribute vec2 a_position;
+      attribute vec2 a_texCoord;
+      varying vec2 v_texCoord;
+      void main() {
+        // 将像素坐标转为 clip space [-1, 1]
+        vec2 clipSpace = (a_position / vec2(${canvas.width}.0, ${canvas.height}.0)) * 2.0 - 1.0;
+        gl_Position = vec4(clipSpace * vec2(1, -1), 0, 1);
+        v_texCoord = a_texCoord;
+      }
+    `;
+    const fsSource = `
+      precision mediump float;
+      varying vec2 v_texCoord;
+      uniform sampler2D u_image;
+      void main() {
+        gl_FragColor = texture2D(u_image, v_texCoord);
+      }
+    `;
+
+    function createShader(gl, type, source) {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, source);
+      gl.compileShader(s);
+      return s;
+    }
+
+    const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
+    const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+    const program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+    gl.useProgram(program);
+
+    const posLoc = gl.getAttribLocation(program, 'a_position');
+    const texLoc = gl.getAttribLocation(program, 'a_texCoord');
+
+    // 纹理坐标 buffer（固定不变）
+    const texCoordBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      0, 0, 1, 0, 0, 1,
+      0, 1, 1, 0, 1, 1,
+    ]), gl.STATIC_DRAW);
+
+    const posBuffer = gl.createBuffer();
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    // ---------- 🔴 最烂的写法：用 Canvas 动态生成大图 → new Image() 同步解码 ----------
+
+    const IMG_COUNT = 500;       // 一次性生成 500 张
+    const IMG_SIZE = 256;        // 每张 256x256（足够大，解码耗时明显）
+    const DESTROY_INTERVAL = 800; // 每 800ms 全部销毁并重新创建
+
+    let textures = [];   // 当前存活的 WebGL 纹理
+    let round = 0;
+
+    /**
+     * 🔴 故意用最糟糕的方式：
+     * 1. 用临时 Canvas 画一张随机颜色的大图
+     * 2. toDataURL() 转 base64（巨大的字符串，产生大量垃圾）
+     * 3. new Image() 同步加载（主线程解码阻塞）
+     * 4. 在 onload 里立刻调用 texImage2D（同步上传 GPU）
+     * 5. 没有任何节流，500 张图一口气塞进去
+     */
+    function createAllTexturesBadly() {
+      round++;
+      document.getElementById('round').textContent = round;
+
+      for (let i = 0; i < IMG_COUNT; i++) {
+        // 步骤1: 每次都 new 一个临时 canvas（产生垃圾）
+        const tmpCanvas = document.createElement('canvas');
+        tmpCanvas.width = IMG_SIZE;
+        tmpCanvas.height = IMG_SIZE;
+        const ctx = tmpCanvas.getContext('2d');
+
+        // 随机颜色填充
+        const r = Math.random() * 255 | 0;
+        const g = Math.random() * 255 | 0;
+        const b = Math.random() * 255 | 0;
+        ctx.fillStyle = `rgb(${r},${g},${b})`;
+        ctx.fillRect(0, 0, IMG_SIZE, IMG_SIZE);
+
+        // 画一些随机线条增加复杂度
+        for (let j = 0; j < 5; j++) {
+          ctx.strokeStyle = `rgba(${Math.random()*255|0},${Math.random()*255|0},${Math.random()*255|0},0.8)`;
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.moveTo(Math.random() * IMG_SIZE, Math.random() * IMG_SIZE);
+          ctx.lineTo(Math.random() * IMG_SIZE, Math.random() * IMG_SIZE);
+          ctx.stroke();
+        }
+
+        // 🔴 步骤2: toDataURL 产生巨大的 base64 字符串（垃圾内存）
+        const dataURL = tmpCanvas.toDataURL('image/png');
+
+        // 🔴 步骤3: new Image() 同步解码
+        const img = new Image();
+        img.src = dataURL;
+
+        // 🔴 步骤4: onload 里同步上传纹理（没有任何调度！）
+        img.onload = function () {
+          const tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+
+          // 🔴 texImage2D —— 同步阻塞主线程！
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+
+          textures.push({
+            texture: tex,
+            x: Math.random() * canvas.width,
+            y: Math.random() * canvas.height,
+            size: 30 + Math.random() * 60,
+          });
+
+          document.getElementById('count').textContent = textures.length;
+        };
+      }
+    }
+
+    // 🔴 暴力销毁所有纹理（不复用，全部丢弃让 GC 回收）
+    function destroyAllTextures() {
+      for (const item of textures) {
+        gl.deleteTexture(item.texture);
+      }
+      // 🔴 直接清空数组，让所有 Image/Canvas/DataURL 字符串变成垃圾
+      textures = [];
+      document.getElementById('count').textContent = 0;
+    }
+
+    // ---------- 渲染循环 ----------
+    function drawQuad(item) {
+      const { x, y, size, texture } = item;
+      const x1 = x, x2 = x + size, y1 = y, y2 = y + size;
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        x1, y1, x2, y1, x1, y2,
+        x1, y2, x2, y1, x2, y2,
+      ]), gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(posLoc);
+      gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+      gl.enableVertexAttribArray(texLoc);
+      gl.vertexAttribPointer(texLoc, 2, gl.FLOAT, false, 0, 0);
+
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+
+    // FPS 计算
+    let frameCount = 0;
+    let lastFpsTime = performance.now();
+
+    function render() {
+      // FPS
+      frameCount++;
+      const now = performance.now();
+      if (now - lastFpsTime >= 1000) {
+        const fps = frameCount;
+        document.getElementById('fps').textContent = fps;
+        document.getElementById('fps').style.color = fps < 50 ? '#ff4444' : '#44ff44';
+        frameCount = 0;
+        lastFpsTime = now;
+      }
+
+      gl.clearColor(0.1, 0.1, 0.18, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      for (const item of textures) {
+        drawQuad(item);
+      }
+
+      requestAnimationFrame(render);
+    }
+
+    // ---------- 启动灾难 ----------
+    // 🔴 定时器：每 800ms 销毁全部 → 重新创建 500 张
+    // 这会导致：1) 大量 Long Task  2) 密集锯齿状 GC
+    setInterval(() => {
+      destroyAllTextures();
+      createAllTexturesBadly();
+    }, DESTROY_INTERVAL);
+
+    // 首次创建
+    createAllTexturesBadly();
+    render();
+
+    console.warn('🔴 阶段1: 灾难模式已启动！请打开 DevTools Performance/Memory 面板观察卡顿和 GC 抖动。');
+
+    // ============================================================
+    // Performance API 自动采集 —— 不需要手动打开 DevTools
+    // ============================================================
+
+    // 1. PerformanceObserver: 监听 Long Task（>50ms 的主线程阻塞）
+    let longTaskCount = 0;
+    let longTaskMax = 0;
+    const longTaskDurations = [];
+
+    if ('PerformanceObserver' in window) {
+      const longTaskObserver = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          longTaskCount++;
+          longTaskMax = Math.max(longTaskMax, entry.duration);
+          longTaskDurations.push(entry.duration);
+          document.getElementById('longTaskCount').textContent = longTaskCount;
+          document.getElementById('longTaskMax').textContent = longTaskMax.toFixed(1);
+        }
+      });
+      try {
+        longTaskObserver.observe({ type: 'longtask', buffered: true });
+      } catch (e) {
+        console.warn('Long Task Observer 不可用:', e.message);
+      }
+    }
+
+    // 2. performance.memory: 采集 JS Heap（Chrome 专属 API）
+    let heapPeak = 0;
+    const heapSamples = [];
+
+    function sampleMemory() {
+      if (performance.memory) {
+        const used = performance.memory.usedJSHeapSize;
+        const total = performance.memory.totalJSHeapSize;
+        const usedMB = (used / 1048576).toFixed(1);
+        const totalMB = (total / 1048576).toFixed(1);
+        heapPeak = Math.max(heapPeak, used);
+
+        heapSamples.push({ t: performance.now(), used, total });
+
+        document.getElementById('heapUsed').textContent = usedMB;
+        document.getElementById('heapTotal').textContent = totalMB;
+        document.getElementById('heapPeak').textContent = (heapPeak / 1048576).toFixed(1);
+      } else {
+        document.getElementById('heapUsed').textContent = 'N/A (需 Chrome)';
+      }
+    }
+
+    // 每 200ms 采样一次内存
+    setInterval(sampleMemory, 200);
+
+    // 3. 每帧耗时（Frame Duration）—— 直接用 rAF 时间差
+    let lastFrameTime = performance.now();
+    const frameDurations = [];
+
+    function measureFrame() {
+      const now = performance.now();
+      const dt = now - lastFrameTime;
+      lastFrameTime = now;
+      frameDurations.push(dt);
+
+      document.getElementById('frameDuration').textContent = dt.toFixed(1);
+      document.getElementById('frameDuration').style.color = dt > 16.6 ? '#ff4444' : '#44ff44';
+
+      requestAnimationFrame(measureFrame);
+    }
+    requestAnimationFrame(measureFrame);
+
+    // 4. 10秒后自动生成采样报告（打印到页面 + console）
+    setTimeout(() => {
+      // GC 锯齿检测：统计内存下降次数（即 GC 发生次数）
+      let gcCount = 0;
+      for (let i = 1; i < heapSamples.length; i++) {
+        const drop = heapSamples[i - 1].used - heapSamples[i].used;
+        if (drop > 500000) gcCount++; // 下降超过 0.5MB 算一次 GC
+      }
+
+      // 帧率分布
+      const droppedFrames = frameDurations.filter(d => d > 20).length;
+      const totalFrames = frameDurations.length;
+      const avgFrameTime = frameDurations.reduce((a, b) => a + b, 0) / totalFrames;
+      const maxFrameTime = Math.max(...frameDurations);
+
+      // Long Task 平均时长
+      const avgLongTask = longTaskDurations.length
+        ? (longTaskDurations.reduce((a, b) => a + b, 0) / longTaskDurations.length).toFixed(1)
+        : 'N/A';
+
+      const report = [
+        `====== 阶段1 性能报告 (10s 采样) ======`,
+        ``,
+        `【Long Task】`,
+        `  总次数: ${longTaskCount}`,
+        `  最长: ${longTaskMax.toFixed(1)} ms`,
+        `  平均: ${avgLongTask} ms`,
+        ``,
+        `【帧率】`,
+        `  总帧数: ${totalFrames}`,
+        `  平均帧耗时: ${avgFrameTime.toFixed(1)} ms (${(1000/avgFrameTime).toFixed(0)} FPS)`,
+        `  最长帧: ${maxFrameTime.toFixed(1)} ms`,
+        `  掉帧次数 (>20ms): ${droppedFrames} / ${totalFrames} (${(droppedFrames/totalFrames*100).toFixed(1)}%)`,
+        ``,
+        `【内存 (JS Heap)】`,
+        `  峰值: ${(heapPeak / 1048576).toFixed(1)} MB`,
+        `  GC 触发次数: ~${gcCount}`,
+        `  采样点数: ${heapSamples.length}`,
+        heapSamples.length >= 2
+          ? `  最低: ${(Math.min(...heapSamples.map(s=>s.used)) / 1048576).toFixed(1)} MB`
+          + `\n  最高: ${(Math.max(...heapSamples.map(s=>s.used)) / 1048576).toFixed(1)} MB`
+          + `\n  波动幅度: ${((Math.max(...heapSamples.map(s=>s.used)) - Math.min(...heapSamples.map(s=>s.used))) / 1048576).toFixed(1)} MB`
+          : '',
+        ``,
+        `========================================`,
+      ].join('\n');
+
+      document.getElementById('report').textContent = report;
+      console.log(report);
+      console.log('📊 原始数据已存储在 window.__perfData 中');
+
+      // 把原始数据挂到 window 上方便你在 Console 里查看
+      window.__perfData = {
+        longTaskDurations,
+        frameDurations,
+        heapSamples,
+        gcCount,
+      };
+    }, 10000);
+  </script>
+</body>
+</html>

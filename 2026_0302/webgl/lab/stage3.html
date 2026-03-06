@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>阶段3：rAF 时间切片调度</title>
+  <style>
+    * { margin: 0; padding: 0; }
+    body { background: #1a1a2e; color: #eee; font-family: monospace; overflow: hidden; }
+    #info {
+      position: fixed; top: 10px; left: 10px; z-index: 999;
+      background: rgba(0,0,0,0.8); padding: 12px 16px; border-radius: 8px;
+      font-size: 14px; line-height: 1.8;
+    }
+    #info .bad { color: #ff4444; font-weight: bold; }
+    #info .good { color: #44ff44; font-weight: bold; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="info">
+    <div>状态: <span id="status" class="good">阶段3 - rAF 时间切片调度</span></div>
+    <div>当前节点数: <span id="count">0</span></div>
+    <div>轮次: <span id="round">0</span></div>
+    <div>FPS: <span id="fps" class="bad">--</span></div>
+    <hr style="border-color:#444; margin:6px 0">
+    <div style="color:#44ff44; font-weight:bold">-- Performance API 实时监控 --</div>
+    <div>Long Task 次数: <span id="longTaskCount" class="bad">0</span></div>
+    <div>最长 Long Task: <span id="longTaskMax" class="bad">0</span> ms</div>
+    <div>JS Heap: <span id="heapUsed" class="bad">--</span> / <span id="heapTotal">--</span> MB</div>
+    <div>Heap 峰值: <span id="heapPeak" class="bad">--</span> MB</div>
+    <div>每帧耗时: <span id="frameDuration" class="bad">--</span> ms</div>
+    <div>上传队列: <span id="queueSize" class="good">0</span> 张待处理</div>
+    <hr style="border-color:#444; margin:6px 0">
+    <div style="color:#44ff44; font-weight:bold">-- 10秒采样报告 --</div>
+    <pre id="report" style="font-size:12px; color:#ccc; white-space:pre-wrap;">等待采样中...</pre>
+  </div>
+  <canvas id="glCanvas"></canvas>
+
+  <script>
+    // ============================================================
+    // 【阶段 3】在阶段 2 基础上，增加 rAF 时间切片调度器
+    //
+    // 阶段 2 的问题：500 个 createImageBitmap 的 Promise 同时 resolve，
+    //   导致 500 次 texImage2D 在同一帧/几帧内密集执行，仍然阻塞主线程
+    //
+    // 阶段 3 的解法：
+    //   🟡 bitmap 解码完成后不立刻执行 texImage2D，而是推入队列
+    //   🟡 rAF 调度器每帧检查剩余时间，只在空闲时间内执行纹理上传
+    //   🟡 时间耗尽则强制中断，推迟到下一帧
+    // ============================================================
+
+    const canvas = document.getElementById('glCanvas');
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    const gl = canvas.getContext('webgl', { antialias: false });
+    if (!gl) { alert('WebGL 不可用'); }
+
+    // ---------- WebGL 着色器（同前）----------
+    const vsSource = `
+      attribute vec2 a_position;
+      attribute vec2 a_texCoord;
+      varying vec2 v_texCoord;
+      void main() {
+        vec2 clipSpace = (a_position / vec2(${canvas.width}.0, ${canvas.height}.0)) * 2.0 - 1.0;
+        gl_Position = vec4(clipSpace * vec2(1, -1), 0, 1);
+        v_texCoord = a_texCoord;
+      }
+    `;
+    const fsSource = `
+      precision mediump float;
+      varying vec2 v_texCoord;
+      uniform sampler2D u_image;
+      void main() {
+        gl_FragColor = texture2D(u_image, v_texCoord);
+      }
+    `;
+
+    function createShader(gl, type, source) {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, source);
+      gl.compileShader(s);
+      return s;
+    }
+
+    const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
+    const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+    const program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+    gl.useProgram(program);
+
+    const posLoc = gl.getAttribLocation(program, 'a_position');
+    const texLoc = gl.getAttribLocation(program, 'a_texCoord');
+
+    const texCoordBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      0, 0, 1, 0, 0, 1,
+      0, 1, 1, 0, 1, 1,
+    ]), gl.STATIC_DRAW);
+
+    const posBuffer = gl.createBuffer();
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    // ---------- 配置 ----------
+    const IMG_COUNT = 500;
+    const IMG_SIZE = 256;
+    const DESTROY_INTERVAL = 800;
+    const FRAME_BUDGET = 12;   // 🟡 每帧留给纹理上传的时间预算（ms）
+                                //    16.6ms 一帧，留 12ms 给上传，剩 4.6ms 给渲染和其他
+
+    let textures = [];
+    let round = 0;
+    let currentRound = 0;
+
+    // ==========================================================
+    // 🟡 核心：纹理上传队列 + rAF 时间切片调度器
+    // ==========================================================
+
+    // 上传队列：存放已解码但还没执行 texImage2D 的 bitmap
+    const uploadQueue = [];
+
+    /**
+     * 🟡 rAF 时间切片调度器
+     *
+     * 核心逻辑：
+     *   1. 记录本帧开始时间
+     *   2. while 循环从队列中取 bitmap
+     *   3. 每取一个，先检查 performance.now() - frameStart < FRAME_BUDGET
+     *   4. 时间没超 → 执行 texImage2D 上传
+     *   5. 时间到了 → break，剩余任务留给下一帧
+     *
+     * 面试话术中的关键句：
+     *   "我只允许在这 5ms 内执行纹理绑定和上传。时间一到，
+     *    哪怕队列里还有 40 张图等在那里，我也强制中断。"
+     */
+    function processUploadQueue(frameStart) {
+      let uploaded = 0;
+
+      while (uploadQueue.length > 0) {
+        // 🟡 时间切片：检查本帧是否还有预算
+        const elapsed = performance.now() - frameStart;
+        if (elapsed >= FRAME_BUDGET) {
+          break; // 时间到！剩余任务推迟到下一帧
+        }
+
+        const task = uploadQueue.shift();
+
+        // 🟡 存活校验（Liveness Check）：
+        // 如果这个 bitmap 属于已过期的轮次，直接丢弃
+        if (task.round !== currentRound) {
+          task.bitmap.close();
+          continue;
+        }
+
+        // 执行 texImage2D（同步，但一帧只做几张，不会爆）
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, task.bitmap);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+
+        // bitmap 上传完毕，立刻释放
+        task.bitmap.close();
+
+        textures.push({
+          texture: tex,
+          x: Math.random() * canvas.width,
+          y: Math.random() * canvas.height,
+          size: 30 + Math.random() * 60,
+        });
+
+        uploaded++;
+      }
+
+      document.getElementById('count').textContent = textures.length;
+      document.getElementById('queueSize').textContent = uploadQueue.length;
+    }
+
+    // ---------- 创建：也做时间切片，避免 500 次 Canvas 创建成为 Long Task ----------
+
+    // 🟡 Canvas 生成队列：把 500 张图的生成也分摊到多帧
+    const createQueue = [];
+    let pendingCreate = false;
+
+    function createAllTexturesAsync() {
+      round++;
+      currentRound = round;
+      document.getElementById('round').textContent = round;
+
+      const thisRound = round;
+
+      // 🟡 不再在一个 for 循环里同步生成 500 张
+      //    而是把 500 个"生成任务"推入 createQueue
+      for (let i = 0; i < IMG_COUNT; i++) {
+        createQueue.push(thisRound);
+      }
+
+      // 启动 Canvas 生成的时间切片调度
+      if (!pendingCreate) {
+        pendingCreate = true;
+        requestAnimationFrame(processCreateQueue);
+      }
+    }
+
+    /**
+     * 🟡 Canvas 生成的时间切片调度器
+     *    每帧最多花 6ms 来创建 Canvas + createImageBitmap
+     *    这样主线程不会被 500 次 createElement 堵死
+     */
+    const CREATE_BUDGET = 6; // ms
+
+    function processCreateQueue(timestamp) {
+      const start = performance.now();
+
+      while (createQueue.length > 0) {
+        if (performance.now() - start >= CREATE_BUDGET) {
+          break; // 时间到，下一帧继续
+        }
+
+        const thisRound = createQueue.shift();
+
+        // 已过期轮次，跳过
+        if (thisRound !== currentRound) continue;
+
+        const tmpCanvas = document.createElement('canvas');
+        tmpCanvas.width = IMG_SIZE;
+        tmpCanvas.height = IMG_SIZE;
+        const ctx = tmpCanvas.getContext('2d');
+
+        const r = Math.random() * 255 | 0;
+        const g = Math.random() * 255 | 0;
+        const b = Math.random() * 255 | 0;
+        ctx.fillStyle = `rgb(${r},${g},${b})`;
+        ctx.fillRect(0, 0, IMG_SIZE, IMG_SIZE);
+
+        for (let j = 0; j < 5; j++) {
+          ctx.strokeStyle = `rgba(${Math.random()*255|0},${Math.random()*255|0},${Math.random()*255|0},0.8)`;
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.moveTo(Math.random() * IMG_SIZE, Math.random() * IMG_SIZE);
+          ctx.lineTo(Math.random() * IMG_SIZE, Math.random() * IMG_SIZE);
+          ctx.stroke();
+        }
+
+        createImageBitmap(tmpCanvas).then((bitmap) => {
+          if (thisRound !== currentRound) {
+            bitmap.close();
+            return;
+          }
+          uploadQueue.push({ bitmap, round: thisRound });
+          document.getElementById('queueSize').textContent = uploadQueue.length;
+        });
+      }
+
+      if (createQueue.length > 0) {
+        requestAnimationFrame(processCreateQueue); // 还有剩余，下一帧继续
+      } else {
+        pendingCreate = false;
+      }
+    }
+
+    function destroyAllTextures() {
+      for (const item of textures) {
+        gl.deleteTexture(item.texture);
+      }
+      textures = [];
+
+      // 🟡 清空上传队列
+      while (uploadQueue.length > 0) {
+        const task = uploadQueue.pop();
+        task.bitmap.close();
+      }
+
+      // 🟡 清空创建队列
+      createQueue.length = 0;
+
+      document.getElementById('count').textContent = 0;
+      document.getElementById('queueSize').textContent = 0;
+    }
+
+    // ---------- 渲染循环（集成调度器）----------
+
+    function drawQuad(item) {
+      const { x, y, size, texture } = item;
+      const x1 = x, x2 = x + size, y1 = y, y2 = y + size;
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        x1, y1, x2, y1, x1, y2,
+        x1, y2, x2, y1, x2, y2,
+      ]), gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(posLoc);
+      gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+      gl.enableVertexAttribArray(texLoc);
+      gl.vertexAttribPointer(texLoc, 2, gl.FLOAT, false, 0, 0);
+
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+
+    let frameCount = 0;
+    let lastFpsTime = performance.now();
+
+    function render() {
+      const frameStart = performance.now();
+
+      // 🟡 先处理上传队列（在时间预算内）
+      processUploadQueue(frameStart);
+
+      // FPS
+      frameCount++;
+      const now = performance.now();
+      if (now - lastFpsTime >= 1000) {
+        const fps = frameCount;
+        document.getElementById('fps').textContent = fps;
+        document.getElementById('fps').style.color = fps < 50 ? '#ff4444' : '#44ff44';
+        frameCount = 0;
+        lastFpsTime = now;
+      }
+
+      // 渲染
+      gl.clearColor(0.1, 0.1, 0.18, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      for (const item of textures) {
+        drawQuad(item);
+      }
+
+      requestAnimationFrame(render);
+    }
+
+    // ---------- 启动 ----------
+    setInterval(() => {
+      destroyAllTextures();
+      createAllTexturesAsync();
+    }, DESTROY_INTERVAL);
+
+    createAllTexturesAsync();
+    render();
+
+    console.log('🟡 阶段3: rAF 时间切片调度模式已启动');
+
+    // ============================================================
+    // Performance API 监控（同前）
+    // ============================================================
+
+    let longTaskCount = 0;
+    let longTaskMax = 0;
+    const longTaskDurations = [];
+
+    if ('PerformanceObserver' in window) {
+      const longTaskObserver = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          longTaskCount++;
+          longTaskMax = Math.max(longTaskMax, entry.duration);
+          longTaskDurations.push(entry.duration);
+          document.getElementById('longTaskCount').textContent = longTaskCount;
+          document.getElementById('longTaskMax').textContent = longTaskMax.toFixed(1);
+        }
+      });
+      try {
+        longTaskObserver.observe({ type: 'longtask', buffered: true });
+      } catch (e) {
+        console.warn('Long Task Observer 不可用:', e.message);
+      }
+    }
+
+    let heapPeak = 0;
+    const heapSamples = [];
+
+    function sampleMemory() {
+      if (performance.memory) {
+        const used = performance.memory.usedJSHeapSize;
+        const total = performance.memory.totalJSHeapSize;
+        const usedMB = (used / 1048576).toFixed(1);
+        const totalMB = (total / 1048576).toFixed(1);
+        heapPeak = Math.max(heapPeak, used);
+        heapSamples.push({ t: performance.now(), used, total });
+        document.getElementById('heapUsed').textContent = usedMB;
+        document.getElementById('heapTotal').textContent = totalMB;
+        document.getElementById('heapPeak').textContent = (heapPeak / 1048576).toFixed(1);
+      }
+    }
+    setInterval(sampleMemory, 200);
+
+    let lastFrameTime = performance.now();
+    const frameDurations = [];
+
+    function measureFrame() {
+      const now = performance.now();
+      const dt = now - lastFrameTime;
+      lastFrameTime = now;
+      frameDurations.push(dt);
+      document.getElementById('frameDuration').textContent = dt.toFixed(1);
+      document.getElementById('frameDuration').style.color = dt > 16.6 ? '#ff4444' : '#44ff44';
+      requestAnimationFrame(measureFrame);
+    }
+    requestAnimationFrame(measureFrame);
+
+    setTimeout(() => {
+      let gcCount = 0;
+      for (let i = 1; i < heapSamples.length; i++) {
+        const drop = heapSamples[i - 1].used - heapSamples[i].used;
+        if (drop > 500000) gcCount++;
+      }
+
+      const droppedFrames = frameDurations.filter(d => d > 20).length;
+      const totalFrames = frameDurations.length;
+      const avgFrameTime = frameDurations.reduce((a, b) => a + b, 0) / totalFrames;
+      const maxFrameTime = Math.max(...frameDurations);
+
+      const avgLongTask = longTaskDurations.length
+        ? (longTaskDurations.reduce((a, b) => a + b, 0) / longTaskDurations.length).toFixed(1)
+        : 'N/A';
+
+      const report = [
+        `====== 阶段3 性能报告 (10s 采样) ======`,
+        ``,
+        `【Long Task】`,
+        `  总次数: ${longTaskCount}`,
+        `  最长: ${longTaskMax.toFixed(1)} ms`,
+        `  平均: ${avgLongTask} ms`,
+        ``,
+        `【帧率】`,
+        `  总帧数: ${totalFrames}`,
+        `  平均帧耗时: ${avgFrameTime.toFixed(1)} ms (${(1000/avgFrameTime).toFixed(0)} FPS)`,
+        `  最长帧: ${maxFrameTime.toFixed(1)} ms`,
+        `  掉帧次数 (>20ms): ${droppedFrames} / ${totalFrames} (${(droppedFrames/totalFrames*100).toFixed(1)}%)`,
+        ``,
+        `【内存 (JS Heap)】`,
+        `  峰值: ${(heapPeak / 1048576).toFixed(1)} MB`,
+        `  GC 触发次数: ~${gcCount}`,
+        `  采样点数: ${heapSamples.length}`,
+        heapSamples.length >= 2
+          ? `  最低: ${(Math.min(...heapSamples.map(s=>s.used)) / 1048576).toFixed(1)} MB`
+          + `\n  最高: ${(Math.max(...heapSamples.map(s=>s.used)) / 1048576).toFixed(1)} MB`
+          + `\n  波动幅度: ${((Math.max(...heapSamples.map(s=>s.used)) - Math.min(...heapSamples.map(s=>s.used))) / 1048576).toFixed(1)} MB`
+          : '',
+        ``,
+        `========================================`,
+      ].join('\n');
+
+      document.getElementById('report').textContent = report;
+      console.log(report);
+      window.__perfData = { longTaskDurations, frameDurations, heapSamples, gcCount };
+    }, 10000);
+  </script>
+</body>
+</html>
